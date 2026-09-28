@@ -88,14 +88,10 @@ def health_check():
 async def universal_media_stream(
     websocket: WebSocket, 
     provider: str, 
-    ticket_id: str = Query(None),       # Allow direct ticket ID
-    caller_phone: str = Query(None),    # Allow caller phone lookup
+    ticket_id: str = Query(None),       
+    caller_phone: str = Query(None),    
     api_key: str = Query(None)
 ):
-    """
-    The BYOT Ingress Router:
-    Supports ?ticket_id=1 OR ?caller_phone=+14155551212
-    """
     # 1. Enforce Authentication
     is_valid = await authenticate_connection(api_key)
     if not is_valid:
@@ -110,21 +106,29 @@ async def universal_media_stream(
     if not target_ticket_id and caller_phone:
         target_ticket_id = await get_ticket_id_by_phone(caller_phone)
     elif not target_ticket_id:
-        target_ticket_id = "1"  # Default fallback for testing
+        target_ticket_id = "1" 
 
     print(f"[{provider.upper()}] Stream connected and mapped to Ticket ID: {target_ticket_id}")
 
+    # Capture the main thread's asyncio loop to safely execute Gemini later
+    loop = asyncio.get_running_loop()
     dg_connection = None
+    
     try:
         dg_connection = deepgram.listen.websocket.v("1")
         
         def on_message(self, result, **kwargs):
-            if 'channel' in result:
+            if hasattr(result, 'channel') and result.channel:
                 transcript = result.channel.alternatives[0].transcript
-                if transcript and result.speech_final:
+                # Use is_final instead of speech_final to catch abrupt clip endings
+                if transcript and result.is_final:
                     print(f"[{target_ticket_id}] Final Transcript: {transcript}")
-                    # Push using the resolved target ticket ID
-                    asyncio.create_task(generate_and_push_suggestion(transcript, target_ticket_id))
+                    
+                    # Safely dispatch the RAG Engine task back to the main thread
+                    asyncio.run_coroutine_threadsafe(
+                        generate_and_push_suggestion(transcript, target_ticket_id), 
+                        loop
+                    )
 
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
         options = LiveOptions(model="nova-2", encoding="mulaw", sample_rate=8000)
@@ -141,21 +145,28 @@ async def universal_media_stream(
                         dg_connection.send(audio)
                     elif msg["event"] == "stop":
                         print(f"Stop event received for ticket {target_ticket_id}")
-                        break
+                        # Force Deepgram to flush its final transcript buffer, 
+                        # but DO NOT break out of the loop yet. Allow the client 
+                        # to naturally disconnect so we can catch the final text.
+                        dg_connection.finish()
                         
             elif provider.lower() in ["raw", "genesys", "amazon"]:
                 if "bytes" in message:
                     dg_connection.send(message["bytes"])
                 elif "text" in message and message["text"] == "stop":
-                    break
+                    dg_connection.finish()
 
     except WebSocketDisconnect:
-        print(f"Client disconnected for ticket {target_ticket_id}")
+        print(f"Client stream disconnected for ticket {target_ticket_id}")
     except Exception as e:
         print(f"Stream processing error: {e}")
     finally:
+        # Failsafe cleanup
         if dg_connection:
-            dg_connection.finish()
+            try:
+                dg_connection.finish()
+            except Exception:
+                pass
 
 # 1. Fetch Ticket ID from Zendesk
 async def get_ticket_id_by_phone(caller_phone: str) -> str:
