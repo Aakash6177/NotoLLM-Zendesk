@@ -82,20 +82,21 @@ def health_check():
 
 
 # 4. The WebSocket Audio Stream
+# Replace Section 4 in your main.py with this:
+
 @app.websocket("/stream/{provider}/")
 async def universal_media_stream(
     websocket: WebSocket, 
     provider: str, 
-    ticket_id: str = Query(None),
-    caller_phone: str = Query(None), # The telephony provider passes the caller's phone here
+    ticket_id: str = Query(None),       # Allow direct ticket ID
+    caller_phone: str = Query(None),    # Allow caller phone lookup
     api_key: str = Query(None)
 ):
     """
     The BYOT Ingress Router:
-    URL Format: wss://your-backend.com/stream/twilio/?caller_phone=+14155551212&api_key=cust_live_123abc
+    Supports ?ticket_id=1 OR ?caller_phone=+14155551212
     """
-    
-    # Enforce Authentication
+    # 1. Enforce Authentication
     is_valid = await authenticate_connection(api_key)
     if not is_valid:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -103,15 +104,15 @@ async def universal_media_stream(
         return
         
     await websocket.accept()
-    
-    # Dynamically fetch the ticket ID based on the phone number
-    if not caller_phone:
-        print("No caller_phone provided. Dropping connection.")
-        await websocket.close()
-        return
-        
-    ticket_id = await get_ticket_id_by_phone(caller_phone)
-    print(f"[{provider.upper()}] Stream connected mapped to ticket: {ticket_id}")
+
+    # 2. Resolve Target Ticket ID
+    target_ticket_id = ticket_id
+    if not target_ticket_id and caller_phone:
+        target_ticket_id = await get_ticket_id_by_phone(caller_phone)
+    elif not target_ticket_id:
+        target_ticket_id = "1"  # Default fallback for testing
+
+    print(f"[{provider.upper()}] Stream connected and mapped to Ticket ID: {target_ticket_id}")
 
     dg_connection = None
     try:
@@ -121,8 +122,9 @@ async def universal_media_stream(
             if 'channel' in result:
                 transcript = result.channel.alternatives[0].transcript
                 if transcript and result.speech_final:
-                    # Pass the dynamically resolved ticket_id to the RAG function
-                    asyncio.create_task(generate_and_push_suggestion(transcript, ticket_id))
+                    print(f"[{target_ticket_id}] Final Transcript: {transcript}")
+                    # Push using the resolved target ticket ID
+                    asyncio.create_task(generate_and_push_suggestion(transcript, target_ticket_id))
 
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
         options = LiveOptions(model="nova-2", encoding="mulaw", sample_rate=8000)
@@ -138,6 +140,7 @@ async def universal_media_stream(
                         audio = base64.b64decode(msg["media"]["payload"])
                         dg_connection.send(audio)
                     elif msg["event"] == "stop":
+                        print(f"Stop event received for ticket {target_ticket_id}")
                         break
                         
             elif provider.lower() in ["raw", "genesys", "amazon"]:
@@ -147,7 +150,7 @@ async def universal_media_stream(
                     break
 
     except WebSocketDisconnect:
-        print(f"Client disconnected for ticket {ticket_id}")
+        print(f"Client disconnected for ticket {target_ticket_id}")
     except Exception as e:
         print(f"Stream processing error: {e}")
     finally:

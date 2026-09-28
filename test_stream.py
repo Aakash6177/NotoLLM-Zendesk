@@ -2,53 +2,90 @@ import asyncio
 import websockets
 import json
 import base64
-import requests
-import io
+import os
+import subprocess
 import wave
-import audioop
 
-# 1. Target URL pointing directly to Ticket 1 on your live Render backend
+# Target URL pointing directly to Ticket 1 on your live Render backend
 BACKEND_WS_URL = "wss://notollm-zendesk-backend.onrender.com/stream/twilio/?ticket_id=1&api_key=cust_live_123abc"
 
-def generate_sample_mulaw() -> bytes:
-    """
-    Fetches a brief speech audio sample and converts it to 8000Hz mono μ-law 
-    (matching standard Twilio / Telephony streams).
-    """
-    print("Preparing test audio sample...")
-    # Public domain sample utterance: "Can I get a refund for my order?"
-    # Using a reliable raw wav fixture or generating standard telephone audio
-    url = "https://raw.githubusercontent.com/voxserv/audio-samples/master/speech/speech-male-16k.wav"
-    r = requests.get(url)
+# Pure Python linear PCM 16-bit to G.711 u-law converter (Zero external dependencies)
+BIAS = 0x84
+CLIP = 32635
+EXPONENT_LUT = [
+    0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7
+]
+
+def pcm16_to_ulaw_byte(sample: int) -> int:
+    sign = (sample >> 8) & 0x80
+    if sign != 0:
+        sample = -sample
+    if sample > CLIP:
+        sample = CLIP
+    sample += BIAS
+    exponent = EXPONENT_LUT[(sample >> 7) & 0xFF]
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    ulawbyte = ~(sign | (exponent << 4) | mantissa) & 0xFF
+    return ulawbyte
+
+def get_sample_speech_mulaw() -> bytes:
+    """Uses macOS built-in speech synthesis to generate real-time test audio."""
+    print("Synthesizing test speech using macOS 'say' command...")
     
-    with wave.open(io.BytesIO(r.content), 'rb') as wav_in:
-        n_channels = wav_in.getnchannels()
-        sampwidth = wav_in.getsampwidth()
-        framerate = wav_in.getframerate()
-        frames = wav_in.readframes(wav_in.getnframes())
+    # You can change this text to test different Gemini RAG responses
+    text = "Hello, I am calling about a recent purchase. What is your return policy on damaged items?"
+    filepath = "mock_speech.wav"
+    
+    # Trigger macOS 'say' command to generate an 8000Hz 16-bit PCM WAV file
+    subprocess.run([
+        "say",
+        "-o", filepath,
+        "--data-format=LEI16@8000",
+        text
+    ], check=True)
 
-    # Downmix to mono if stereo
-    if n_channels == 2:
-        frames = audioop.tomono(frames, sampwidth, 0.5, 0.5)
+    # Read the generated WAV file
+    with wave.open(filepath, 'rb') as wav_file:
+        n_channels = wav_file.getnchannels()
+        raw_pcm = wav_file.readframes(wav_file.getnframes())
+        
+    # Clean up the local file
+    if os.path.exists(filepath):
+        os.remove(filepath)
 
-    # Resample to 8000 Hz if needed
-    if framerate != 8000:
-        frames, _ = audioop.ratecv(frames, sampwidth, 1, framerate, 8000, None)
+    # Convert 16-bit signed PCM frames to 8-bit mu-law
+    ulaw_bytes = bytearray()
+    step = 2 * n_channels
+    for i in range(0, len(raw_pcm), step):
+        sample = int.from_bytes(raw_pcm[i:i+2], byteorder='little', signed=True)
+        ulaw_bytes.append(pcm16_to_ulaw_byte(sample))
 
-    # Convert linear PCM 16-bit to 8-bit μ-law (standard G.711u / Twilio payload)
-    mulaw_data = audioop.lin2ulaw(frames, sampwidth)
-    return mulaw_data
-
+    return bytes(ulaw_bytes)
 
 async def run_mock_call():
-    audio_data = generate_sample_mulaw()
-    print(f"Total audio ready: {len(audio_data)} bytes (~{len(audio_data) / 8000:.1f} seconds).")
+    audio_data = get_sample_speech_mulaw()
+    print(f"Audio ready: {len(audio_data)} bytes (~{len(audio_data)/8000:.1f} seconds).")
 
     print(f"Connecting to: {BACKEND_WS_URL}")
     async with websockets.connect(BACKEND_WS_URL) as ws:
         print("Connected to Render WebSocket backend.")
 
-        # Step 1: Send Twilio 'start' event
+        # 1. Send Twilio start event
         start_payload = {
             "event": "start",
             "sequenceNumber": "1",
@@ -60,31 +97,27 @@ async def run_mock_call():
         }
         await ws.send(json.dumps(start_payload))
 
-        # Step 2: Stream in 20ms chunks (160 bytes of μ-law at 8000 samples/sec = 20ms)
-        CHUNK_SIZE = 160 
+        # 2. Stream in 20ms chunks (160 bytes of 8000Hz mu-law = 20ms)
+        CHUNK_SIZE = 160
         print("Streaming speech audio frames in real-time...")
 
         for i in range(0, len(audio_data), CHUNK_SIZE):
             chunk = audio_data[i:i + CHUNK_SIZE]
             payload = base64.b64encode(chunk).decode("utf-8")
-            
             media_msg = {
                 "event": "media",
                 "sequenceNumber": str(i // CHUNK_SIZE + 2),
-                "media": {
-                    "payload": payload
-                }
+                "media": {"payload": payload}
             }
             await ws.send(json.dumps(media_msg))
-            await asyncio.sleep(0.02) # Paced to simulate live caller speech
+            await asyncio.sleep(0.02)  # 20ms real-time pacing
 
-        # Step 3: Send 'stop' event
+        # 3. Send stop event
         stop_payload = {"event": "stop", "sequenceNumber": "9999"}
         await ws.send(json.dumps(stop_payload))
-        print("Call finished. Audio stream completed.")
+        print("Audio stream finished. Awaiting Gemini and Firebase response...")
 
-        # Keep open briefly to allow final speech transcripts to settle
-        await asyncio.sleep(3)
+        await asyncio.sleep(4)
 
 if __name__ == "__main__":
     asyncio.run(run_mock_call())
