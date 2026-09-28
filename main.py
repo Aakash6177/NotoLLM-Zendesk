@@ -33,7 +33,7 @@ deepgram = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 # Using Flash because it is optimized for high-frequency, low-latency tasks
-gemini_model = genai.GenerativeModel('gemini-pro')
+gemini_model = genai.GenerativeModel('gemini-2.5-flash')
 
 # Mock database of valid customer API keys
 VALID_API_KEYS = {"cust_live_123abc", "cust_live_456def"}
