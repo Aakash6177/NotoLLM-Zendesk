@@ -60,10 +60,7 @@ async def generate_and_push_suggestion(transcript: str, ticket_id: str):
         # Use Gemini's async generation to avoid blocking the websocket stream
         response = await gemini_client.aio.models.generate_content(
             model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_level="low"),
-            ),
+            contents=prompt
         )
         suggestion_text = response.text or ""
 

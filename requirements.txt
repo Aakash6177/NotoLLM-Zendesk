@@ -1,7 +1,7 @@
 fastapi==0.141.1
 uvicorn==0.54.0
 deepgram-sdk==4.8.0
-google-genai==1.2.0
+google-genai
 websockets==14.2
 firebase-admin==6.2.0
 httpx==0.27.0
