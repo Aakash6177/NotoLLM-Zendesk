@@ -115,7 +115,7 @@ async def universal_media_stream(
     dg_connection = None
     
     try:
-        dg_connection = deepgram.listen.websocket.v("1")
+        dg_connection = deepgram.listen.live.v("1")
         
         def on_message(self, result, **kwargs):
             if hasattr(result, 'channel') and result.channel:
