@@ -1,6 +1,8 @@
 import os
 import json
 import base64
+import httpx
+import urllib.parse
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, status
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
@@ -80,27 +82,35 @@ def health_check():
 
 
 # 4. The WebSocket Audio Stream
-@app.websocket("/stream/{provider}/{ticket_id}")
+@app.websocket("/stream/{provider}/")
 async def universal_media_stream(
     websocket: WebSocket, 
     provider: str, 
-    ticket_id: str, 
+    caller_phone: str = Query(None), # The telephony provider passes the caller's phone here
     api_key: str = Query(None)
 ):
     """
     The BYOT Ingress Router:
-    URL Format: wss://your-backend.com/stream/twilio/12345?api_key=cust_live_123abc
+    URL Format: wss://your-backend.com/stream/twilio/?caller_phone=+14155551212&api_key=cust_live_123abc
     """
     
-    # 1. Enforce Authentication
+    # Enforce Authentication
     is_valid = await authenticate_connection(api_key)
     if not is_valid:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        print(f"Rejected connection for ticket {ticket_id}: Invalid API Key")
+        print("Rejected connection: Invalid API Key")
         return
         
     await websocket.accept()
-    print(f"[{provider.upper()}] Stream connected for ticket: {ticket_id}")
+    
+    # Dynamically fetch the ticket ID based on the phone number
+    if not caller_phone:
+        print("No caller_phone provided. Dropping connection.")
+        await websocket.close()
+        return
+        
+    ticket_id = await get_ticket_id_by_phone(caller_phone)
+    print(f"[{provider.upper()}] Stream connected mapped to ticket: {ticket_id}")
 
     dg_connection = None
     try:
@@ -110,23 +120,17 @@ async def universal_media_stream(
             if 'channel' in result:
                 transcript = result.channel.alternatives[0].transcript
                 if transcript and result.speech_final:
-                    print(f"[{ticket_id}] Final Transcript: {transcript}")
+                    # Pass the dynamically resolved ticket_id to the RAG function
                     asyncio.create_task(generate_and_push_suggestion(transcript, ticket_id))
 
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
-        
-        # In a full production app, you might map the encoding based on the provider 
-        # (e.g., Twilio is mulaw, others might be linear16)
         options = LiveOptions(model="nova-2", encoding="mulaw", sample_rate=8000)
         dg_connection.start(options)
 
-        # 2. The Normalization Loop
         while True:
-            # receive() gets either text (JSON) or bytes based on what the client sends
             message = await websocket.receive()
             
             if provider.lower() == "twilio":
-                # Twilio sends base64 encoded audio wrapped in JSON strings
                 if "text" in message:
                     msg = json.loads(message["text"])
                     if msg["event"] == "media":
@@ -136,7 +140,6 @@ async def universal_media_stream(
                         break
                         
             elif provider.lower() in ["raw", "genesys", "amazon"]:
-                # Enterprise CTI systems often stream raw binary frames natively
                 if "bytes" in message:
                     dg_connection.send(message["bytes"])
                 elif "text" in message and message["text"] == "stop":
@@ -149,3 +152,42 @@ async def universal_media_stream(
     finally:
         if dg_connection:
             dg_connection.finish()
+
+# 1. Fetch Ticket ID from Zendesk
+async def get_ticket_id_by_phone(caller_phone: str) -> str:
+    """Queries the Zendesk Search API to find an open ticket for the calling phone number."""
+    subdomain = os.getenv("ZENDESK_SUBDOMAIN")
+    email = os.getenv("ZENDESK_EMAIL")
+    token = os.getenv("ZENDESK_API_TOKEN")
+    
+    if not all([subdomain, email, token]):
+        print("Zendesk credentials missing. Falling back to default ticket ID.")
+        return "DEFAULT_TICKET"
+
+    # Zendesk requires URL encoding for phone numbers (e.g., +14155551212 becomes %2B14155551212)
+    encoded_phone = urllib.parse.quote(caller_phone)
+    
+    # Query: Find open tickets where the requester matches this phone number
+    search_query = f"type:ticket requester:{encoded_phone} status<solved"
+    url = f"https://{subdomain}.zendesk.com/api/v2/search.json?query={search_query}"
+    
+    auth = (f"{email}/token", token)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, auth=auth)
+            response.raise_for_status()
+            data = response.json()
+            
+            # If a ticket is found, return the ID of the most recent one
+            if data.get("results") and len(data["results"]) > 0:
+                ticket_id = str(data["results"][0]["id"])
+                print(f"Found active Zendesk Ticket: {ticket_id} for phone: {caller_phone}")
+                return ticket_id
+            else:
+                print(f"No open ticket found for phone {caller_phone}. Generating fallback ID.")
+                return f"UNMATCHED_{caller_phone.replace('+', '')}"
+                
+        except Exception as e:
+            print(f"Zendesk API Search Error: {e}")
+            return "ERROR_TICKET"
