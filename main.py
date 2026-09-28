@@ -6,7 +6,8 @@ import urllib.parse
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, status
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -31,9 +32,9 @@ except Exception as e:
 app = FastAPI()
 deepgram = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # Using Flash because it is optimized for high-frequency, low-latency tasks
-gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 # Mock database of valid customer API keys
 VALID_API_KEYS = {"cust_live_123abc", "cust_live_456def"}
@@ -57,8 +58,14 @@ async def generate_and_push_suggestion(transcript: str, ticket_id: str):
 
     try:
         # Use Gemini's async generation to avoid blocking the websocket stream
-        response = await gemini_model.generate_content_async(prompt)
-        suggestion_text = response.text
+        response = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        suggestion_text = response.text or ""
 
         # Push to Firebase State Store
         doc_ref = db.collection("tickets").document(ticket_id).collection("suggestions").document()
@@ -136,6 +143,10 @@ async def universal_media_stream(
 
         while True:
             message = await websocket.receive()
+
+            if message["type"] == "websocket.disconnect":
+                print(f"Client disconnected for ticket {target_ticket_id}")
+                break
             
             if provider.lower() == "twilio":
                 if "text" in message:
