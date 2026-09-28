@@ -86,6 +86,7 @@ def health_check():
 async def universal_media_stream(
     websocket: WebSocket, 
     provider: str, 
+    ticket_id: str = Query(None),
     caller_phone: str = Query(None), # The telephony provider passes the caller's phone here
     api_key: str = Query(None)
 ):
