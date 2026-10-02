@@ -12,6 +12,12 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import asyncio
 from google.genai.errors import APIError
+from pydantic import BaseModel
+
+class AgentQuery(BaseModel):
+    query: str
+    ticket_id: str
+    requester_id: str
 
 # 1. Initialize Firebase Admin securely for both Local & Render
 # Render mounts Secret Files in the /etc/secrets/ directory for Docker environments
@@ -48,6 +54,34 @@ async def authenticate_connection(api_key: str = Query(None)):
         # so we validate it before fully upgrading the connection.
         return False
     return True
+
+async def generate_grounded_answer(query: str, context_block: str, ticket_id: str):
+    prompt = f"""
+    You are an internal support AI for agents. Answer the agent's query based ONLY on the provided Zendesk Knowledge Base articles.
+    
+    Agent Query: {query}
+    
+    Zendesk Knowledge Base Context:
+    {context_block}
+    
+    Instructions:
+    1. Answer clearly and concisely.
+    2. You MUST cite your source inline using the format [Source: Article Title].
+    3. If the answer is not in the provided context, say "I cannot find this information in the Help Center."
+    """
+    
+    response = await gemini_client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt
+    )
+    
+    # Push the AI's grounded response to Firebase so it appears in the sidebar
+    db.collection("tickets").document(ticket_id).collection("suggestions").document().set({
+        "title": "🧠 AI Answer",
+        "text": response.text.strip(),
+        "source": "Zendesk Help Center",
+        "timestamp": firestore.SERVER_TIMESTAMP
+    })
 
 async def generate_and_push_suggestion(transcript: str, ticket_id: str):
     """The RAG Engine: Runs Gemini and pushes to Firebase with retry logic"""
@@ -101,6 +135,27 @@ def health_check():
     """Render pings the root URL to verify the container is alive."""
     return {"status": "healthy", "service": "ai-agent-assist"}
 
+@app.post("/ask")
+async def process_agent_query(payload: AgentQuery):
+    # 1. Fetch relevant Knowledge Base articles from Zendesk Guide
+    subdomain = os.getenv("ZENDESK_SUBDOMAIN")
+    encoded_query = urllib.parse.quote(payload.query)
+    search_url = f"https://{subdomain}.zendesk.com/api/v2/help_center/articles/search.json?query={encoded_query}"
+    
+    auth = (f"{os.getenv('ZENDESK_EMAIL')}/token", os.getenv("ZENDESK_API_TOKEN"))
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(search_url, auth=auth)
+        articles = response.json().get("results", [])[:3] # Top 3 articles
+        
+    # 2. Format the retrieved data into a context block
+    context_block = "\n".join(
+        [f"Source: {article['title']}\nContent: {article['body']}" for article in articles]
+    )
+
+    # 3. Prompt Gemini with Grounding Instructions
+    asyncio.create_task(generate_grounded_answer(payload.query, context_block, payload.ticket_id))
+    return {"status": "processing"}
 
 # 4. The WebSocket Audio Stream
 # Replace Section 4 in your main.py with this:
