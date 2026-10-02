@@ -10,6 +10,8 @@ from google import genai
 from google.genai import types
 import firebase_admin
 from firebase_admin import credentials, firestore
+import asyncio
+from google.genai.errors import APIError
 
 # 1. Initialize Firebase Admin securely for both Local & Render
 # Render mounts Secret Files in the /etc/secrets/ directory for Docker environments
@@ -48,7 +50,7 @@ async def authenticate_connection(api_key: str = Query(None)):
     return True
 
 async def generate_and_push_suggestion(transcript: str, ticket_id: str):
-    """The RAG Engine: Runs Gemini and pushes to Firebase"""
+    """The RAG Engine: Runs Gemini and pushes to Firebase with retry logic"""
     if not db:
         print("Skipping Firebase push: Firebase is not initialized.")
         return
@@ -56,26 +58,41 @@ async def generate_and_push_suggestion(transcript: str, ticket_id: str):
     prompt = f"""You are an agent assist AI. The customer just said: '{transcript}'
     Based on our company policy, generate a very brief, 1-2 sentence helpful recommendation for the support agent."""
 
-    try:
-        # Use Gemini's async generation to avoid blocking the websocket stream
-        response = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
-        )
-        suggestion_text = response.text or ""
+    max_retries = 3
+    base_delay = 1.0
 
-        # Push to Firebase State Store
-        doc_ref = db.collection("tickets").document(ticket_id).collection("suggestions").document()
-        doc_ref.set({
-            "title": "✨ AI Recommendation",
-            "text": suggestion_text.strip(),
-            "source": "Knowledge Base (Auto-generated)",
-            "timestamp": firestore.SERVER_TIMESTAMP
-        })
-        print(f"Pushed Gemini suggestion to Firebase for ticket {ticket_id}")
-        
-    except Exception as e:
-        print(f"Gemini or Firebase Error: {e}")
+    for attempt in range(max_retries):
+        try:
+            response = await gemini_client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt
+            )
+            suggestion_text = response.text or ""
+
+            # Push to Firebase State Store
+            doc_ref = db.collection("tickets").document(ticket_id).collection("suggestions").document()
+            doc_ref.set({
+                "title": "✨ AI Recommendation",
+                "text": suggestion_text.strip(),
+                "source": "Knowledge Base (Auto-generated)",
+                "timestamp": firestore.SERVER_TIMESTAMP
+            })
+            print(f"Pushed Gemini suggestion to Firebase for ticket {ticket_id}")
+            return  # Success, exit the function
+            
+        except APIError as e:
+            if e.code == 503:
+                print(f"Gemini 503 Unavailable (Attempt {attempt + 1}/{max_retries}). Retrying...")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(base_delay * (2 ** attempt)) # Exponential backoff: 1s, 2s, 4s
+                else:
+                    print(f"Failed to generate suggestion after {max_retries} attempts due to high demand.")
+            else:
+                print(f"Gemini API Error: {e}")
+                break # Break on non-retryable errors
+        except Exception as e:
+            print(f"Unexpected Error: {e}")
+            break
 
 
 # 3. Health Check Endpoint for Render Deployments
