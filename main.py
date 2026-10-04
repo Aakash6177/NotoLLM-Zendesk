@@ -5,13 +5,12 @@ import httpx
 import urllib.parse
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, status
+from fastapi.middleware.cors import CORSMiddleware
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
 from google import genai
-from google.genai import types
+from google.genai.errors import APIError
 import firebase_admin
 from firebase_admin import credentials, firestore
-import asyncio
-from google.genai.errors import APIError
 from pydantic import BaseModel
 
 class AgentQuery(BaseModel):
@@ -20,7 +19,6 @@ class AgentQuery(BaseModel):
     requester_id: str
 
 # 1. Initialize Firebase Admin securely for both Local & Render
-# Render mounts Secret Files in the /etc/secrets/ directory for Docker environments
 firebase_key_path = "/etc/secrets/firebase-adminsdk.json" 
 
 if not os.path.exists(firebase_key_path):
@@ -38,59 +36,117 @@ except Exception as e:
 
 # 2. Initialize FastAPI, Deepgram & Gemini
 app = FastAPI()
+
+# Add CORS Middleware so the Zendesk frontend can call the backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows requests from Zendesk iframe domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 deepgram = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-# Using Flash because it is optimized for high-frequency, low-latency tasks
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
-# Mock database of valid customer API keys
 VALID_API_KEYS = {"cust_live_123abc", "cust_live_456def"}
 
 async def authenticate_connection(api_key: str = Query(None)):
     """Validates the customer's API key passed in the WebSocket URL query."""
     if api_key not in VALID_API_KEYS:
-        # In WebSockets, we cannot return standard HTTP 401s easily after accept,
-        # so we validate it before fully upgrading the connection.
         return False
     return True
 
-async def generate_grounded_answer(query: str, context_block: str, ticket_id: str):
-    prompt = f"""
-    You are an internal support AI for agents. Answer the agent's query based ONLY on the provided Zendesk Knowledge Base articles.
+async def search_help_center(query: str) -> str:
+    """Searches Zendesk Help Center articles and returns combined text context."""
+    subdomain = os.getenv("ZENDESK_SUBDOMAIN", "d3v-notollmsupport")
+    encoded_query = urllib.parse.quote(query)
+    url = f"https://{subdomain}.zendesk.com/api/v2/help_center/articles/search.json?query={encoded_query}"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            # No auth needed if articles are public
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("results", [])
+
+            if not results:
+                return ""
+
+            # Extract top 2 articles as context
+            context_parts = []
+            for article in results[:2]:
+                title = article.get("title", "")
+                body = article.get("snippet", "") or article.get("body", "")
+                context_parts.append(f"Source: {title}\nContent: {body}")
+
+            return "\n\n".join(context_parts)
+        except Exception as e:
+            print(f"Error fetching Zendesk articles: {e}")
+            return ""
+
+async def handle_custom_agent_query(query: str, ticket_id: str):
+    """Processes manual queries typed by the agent in the sidebar."""
+    print(f"Processing custom query for ticket {ticket_id}: {query}")
     
-    Agent Query: {query}
+    # Search the Zendesk Knowledge Base
+    kb_context = await search_help_center(query)
     
-    Zendesk Knowledge Base Context:
-    {context_block}
-    
-    Instructions:
-    1. Answer clearly and concisely.
-    2. You MUST cite your source inline using the format [Source: Article Title].
-    3. If the answer is not in the provided context, say "I cannot find this information in the Help Center."
-    """
-    
-    response = await gemini_client.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt
-    )
-    
-    # Push the AI's grounded response to Firebase so it appears in the sidebar
-    db.collection("tickets").document(ticket_id).collection("suggestions").document().set({
-        "title": "🧠 AI Answer",
-        "text": response.text.strip(),
-        "source": "Zendesk Help Center",
-        "timestamp": firestore.SERVER_TIMESTAMP
-    })
+    # Build the strict grounding prompt
+    prompt = f"""You are an internal AI assistant for a customer support agent.
+The agent asked: "{query}"
+
+Company Knowledge Base:
+{kb_context if kb_context else "No relevant articles found."}
+
+Instructions:
+1. Answer the agent's question clearly and concisely.
+2. Ground your answer STRICTLY in the Company Knowledge Base text provided above.
+3. If the answer is not in the knowledge base, say "I cannot find this information in the Help Center."
+4. Always cite the article title at the end of your answer like this: [Source: Article Title]."""
+
+    try:
+        response = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
+        )
+        ai_text = response.text.strip()
+        
+        if db:
+            doc_ref = db.collection("tickets").document(ticket_id).collection("suggestions").document()
+            doc_ref.set({
+                "title": "🧠 AI Answer",
+                "text": ai_text,
+                "source": "Agent Query",
+                "timestamp": firestore.SERVER_TIMESTAMP
+            })
+            print(f"Successfully pushed custom Q&A to Firebase for ticket {ticket_id}")
+        else:
+            print("Firebase DB not initialized.")
+            
+    except Exception as e:
+        print(f"Error generating or pushing answer: {e}")
 
 async def generate_and_push_suggestion(transcript: str, ticket_id: str):
-    """The RAG Engine: Runs Gemini and pushes to Firebase with retry logic"""
+    """The Live Audio RAG Engine: Runs Gemini on live caller transcripts."""
     if not db:
         print("Skipping Firebase push: Firebase is not initialized.")
         return
 
+    kb_context = await search_help_center(transcript)
+
     prompt = f"""You are an agent assist AI. The customer just said: '{transcript}'
-    Based on our company policy, generate a very brief, 1-2 sentence helpful recommendation for the support agent."""
+    
+    Company Knowledge Base:
+    {kb_context if kb_context else "No relevant knowledge base articles found."}
+    
+    Instructions:
+    1. Generate a very brief, 1-2 sentence helpful recommendation for the support agent.
+    2. Ground your recommendation strictly in the Company Knowledge Base if available.
+    3. Cite the article title in brackets at the end if used, e.g. [Source: Article Title]."""
 
     max_retries = 3
     base_delay = 1.0
@@ -103,33 +159,31 @@ async def generate_and_push_suggestion(transcript: str, ticket_id: str):
             )
             suggestion_text = response.text or ""
 
-            # Push to Firebase State Store
             doc_ref = db.collection("tickets").document(ticket_id).collection("suggestions").document()
             doc_ref.set({
                 "title": "✨ AI Recommendation",
                 "text": suggestion_text.strip(),
-                "source": "Knowledge Base (Auto-generated)",
+                "source": "Knowledge Base (Auto-generated)" if kb_context else "General Best Practice",
                 "timestamp": firestore.SERVER_TIMESTAMP
             })
             print(f"Pushed Gemini suggestion to Firebase for ticket {ticket_id}")
-            return  # Success, exit the function
+            return
             
         except APIError as e:
             if e.code == 503:
                 print(f"Gemini 503 Unavailable (Attempt {attempt + 1}/{max_retries}). Retrying...")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(base_delay * (2 ** attempt)) # Exponential backoff: 1s, 2s, 4s
+                    await asyncio.sleep(base_delay * (2 ** attempt))
                 else:
                     print(f"Failed to generate suggestion after {max_retries} attempts due to high demand.")
             else:
                 print(f"Gemini API Error: {e}")
-                break # Break on non-retryable errors
+                break
         except Exception as e:
             print(f"Unexpected Error: {e}")
             break
 
-
-# 3. Health Check Endpoint for Render Deployments
+# 3. HTTP Endpoints
 @app.get("/")
 def health_check():
     """Render pings the root URL to verify the container is alive."""
@@ -137,29 +191,11 @@ def health_check():
 
 @app.post("/ask")
 async def process_agent_query(payload: AgentQuery):
-    # 1. Fetch relevant Knowledge Base articles from Zendesk Guide
-    subdomain = os.getenv("ZENDESK_SUBDOMAIN")
-    encoded_query = urllib.parse.quote(payload.query)
-    search_url = f"https://{subdomain}.zendesk.com/api/v2/help_center/articles/search.json?query={encoded_query}"
-    
-    auth = (f"{os.getenv('ZENDESK_EMAIL')}/token", os.getenv("ZENDESK_API_TOKEN"))
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.get(search_url, auth=auth)
-        articles = response.json().get("results", [])[:3] # Top 3 articles
-        
-    # 2. Format the retrieved data into a context block
-    context_block = "\n".join(
-        [f"Source: {article['title']}\nContent: {article['body']}" for article in articles]
-    )
-
-    # 3. Prompt Gemini with Grounding Instructions
-    asyncio.create_task(generate_grounded_answer(payload.query, context_block, payload.ticket_id))
+    # Run the RAG pipeline in the background so we don't timeout the frontend
+    asyncio.create_task(handle_custom_agent_query(payload.query, payload.ticket_id))
     return {"status": "processing"}
 
 # 4. The WebSocket Audio Stream
-# Replace Section 4 in your main.py with this:
-
 @app.websocket("/stream/{provider}/")
 async def universal_media_stream(
     websocket: WebSocket, 
@@ -168,7 +204,6 @@ async def universal_media_stream(
     caller_phone: str = Query(None),    
     api_key: str = Query(None)
 ):
-    # 1. Enforce Authentication
     is_valid = await authenticate_connection(api_key)
     if not is_valid:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -177,7 +212,6 @@ async def universal_media_stream(
         
     await websocket.accept()
 
-    # 2. Resolve Target Ticket ID
     target_ticket_id = ticket_id
     if not target_ticket_id and caller_phone:
         target_ticket_id = await get_ticket_id_by_phone(caller_phone)
@@ -186,7 +220,6 @@ async def universal_media_stream(
 
     print(f"[{provider.upper()}] Stream connected and mapped to Ticket ID: {target_ticket_id}")
 
-    # Capture the main thread's asyncio loop to safely execute Gemini later
     loop = asyncio.get_running_loop()
     dg_connection = None
     
@@ -196,11 +229,9 @@ async def universal_media_stream(
         def on_message(self, result, **kwargs):
             if hasattr(result, 'channel') and result.channel:
                 transcript = result.channel.alternatives[0].transcript
-                # Use is_final instead of speech_final to catch abrupt clip endings
                 if transcript and result.is_final:
                     print(f"[{target_ticket_id}] Final Transcript: {transcript}")
                     
-                    # Safely dispatch the RAG Engine task back to the main thread
                     asyncio.run_coroutine_threadsafe(
                         generate_and_push_suggestion(transcript, target_ticket_id), 
                         loop
@@ -225,9 +256,6 @@ async def universal_media_stream(
                         dg_connection.send(audio)
                     elif msg["event"] == "stop":
                         print(f"Stop event received for ticket {target_ticket_id}")
-                        # Force Deepgram to flush its final transcript buffer, 
-                        # but DO NOT break out of the loop yet. Allow the client 
-                        # to naturally disconnect so we can catch the final text.
                         dg_connection.finish()
                         
             elif provider.lower() in ["raw", "genesys", "amazon"]:
@@ -241,14 +269,13 @@ async def universal_media_stream(
     except Exception as e:
         print(f"Stream processing error: {e}")
     finally:
-        # Failsafe cleanup
         if dg_connection:
             try:
                 dg_connection.finish()
             except Exception:
                 pass
 
-# 1. Fetch Ticket ID from Zendesk
+# 5. Fetch Ticket ID from Zendesk
 async def get_ticket_id_by_phone(caller_phone: str) -> str:
     """Queries the Zendesk Search API to find an open ticket for the calling phone number."""
     subdomain = os.getenv("ZENDESK_SUBDOMAIN")
@@ -259,10 +286,7 @@ async def get_ticket_id_by_phone(caller_phone: str) -> str:
         print("Zendesk credentials missing. Falling back to default ticket ID.")
         return "DEFAULT_TICKET"
 
-    # Zendesk requires URL encoding for phone numbers (e.g., +14155551212 becomes %2B14155551212)
     encoded_phone = urllib.parse.quote(caller_phone)
-    
-    # Query: Find open tickets where the requester matches this phone number
     search_query = f"type:ticket requester:{encoded_phone} status<solved"
     url = f"https://{subdomain}.zendesk.com/api/v2/search.json?query={search_query}"
     
@@ -274,7 +298,6 @@ async def get_ticket_id_by_phone(caller_phone: str) -> str:
             response.raise_for_status()
             data = response.json()
             
-            # If a ticket is found, return the ID of the most recent one
             if data.get("results") and len(data["results"]) > 0:
                 ticket_id = str(data["results"][0]["id"])
                 print(f"Found active Zendesk Ticket: {ticket_id} for phone: {caller_phone}")
