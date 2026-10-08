@@ -59,54 +59,73 @@ async def authenticate_connection(api_key: str = Query(None)):
         return False
     return True
 
-async def search_help_center(query: str) -> str:
-    """Searches Zendesk Help Center articles and returns combined text context."""
-    subdomain = os.getenv("ZENDESK_SUBDOMAIN", "d3v-notollmsupport")
+async def search_bookstack(query: str) -> str:
+    """Searches BookStack KB on localhost / remote and returns markdown context."""
+    domain = os.getenv("BOOKSTACK_DOMAIN", "localhost:8080")
+    token_id = os.getenv("BOOKSTACK_TOKEN_ID")
+    token_secret = os.getenv("BOOKSTACK_TOKEN_SECRET")
+    
+    if not all([domain, token_id, token_secret]):
+        print("BookStack credentials or domain missing.")
+        return ""
+        
     encoded_query = urllib.parse.quote(query)
-    url = f"https://{subdomain}.zendesk.com/api/v2/help_center/articles/search.json?query={encoded_query}"
-
+    
+    # 1. Determine HTTP vs HTTPS
+    protocol = "http" if any(h in domain for h in ["localhost", "127.0.0.1", "host.docker.internal"]) else "https"
+    
+    search_url = f"{protocol}://{domain}/api/search?query={encoded_query}"
+    headers = {
+        "Authorization": f"Token {token_id}:{token_secret}"
+    }
+    
     async with httpx.AsyncClient() as client:
         try:
-            # No auth needed if articles are public
-            response = await client.get(url)
+            # 2. Search for matching pages
+            response = await client.get(search_url, headers=headers)
             response.raise_for_status()
             data = response.json()
-            results = data.get("results", [])
-
+            
+            results = [item for item in data.get("data", []) if item.get("type") == "page"]
             if not results:
                 return ""
-
-            # Extract top 2 articles as context
+                
+            # 3. Pull top 2 articles and their markdown body
             context_parts = []
             for article in results[:2]:
-                title = article.get("title", "")
-                body = article.get("snippet", "") or article.get("body", "")
-                context_parts.append(f"Source: {title}\nContent: {body}")
-
+                title = article.get("name", "")
+                page_id = article.get("id")
+                
+                page_url = f"{protocol}://{domain}/api/pages/{page_id}"
+                page_resp = await client.get(page_url, headers=headers)
+                
+                if page_resp.status_code == 200:
+                    page_data = page_resp.json()
+                    body = page_data.get("markdown", "") or page_data.get("preview_html", "")
+                    context_parts.append(f"Source: {title}\nContent: {body[:2000]}")
+                
             return "\n\n".join(context_parts)
+            
         except Exception as e:
-            print(f"Error fetching Zendesk articles: {e}")
+            print(f"Error fetching from BookStack: {e}")
             return ""
 
 async def handle_custom_agent_query(query: str, ticket_id: str):
-    """Processes manual queries typed by the agent in the sidebar."""
-    print(f"Processing custom query for ticket {ticket_id}: {query}")
+    print(f"Processing query for ticket {ticket_id}: {query}")
     
-    # Search the Zendesk Knowledge Base
-    kb_context = await search_help_center(query)
+    # Swap out search_help_center with search_bookstack
+    kb_context = await search_bookstack(query)
     
-    # Build the strict grounding prompt
-    prompt = f"""You are an internal AI assistant for a customer support agent.
-The agent asked: "{query}"
+    prompt = f"""You are an internal AI assistant for a customer support agent. The agent asked: "{query}"
 
-Company Knowledge Base:
+Company Knowledge Base (BookStack):
 {kb_context if kb_context else "No relevant articles found."}
 
 Instructions:
 1. Answer the agent's question clearly and concisely.
 2. Ground your answer STRICTLY in the Company Knowledge Base text provided above.
-3. If the answer is not in the knowledge base, say "I cannot find this information in the Help Center."
-4. Always cite the article title at the end of your answer like this: [Source: Article Title]."""
+3. If the answer is not in the knowledge base, say "I cannot find this information in the Knowledge Base."
+4. Always cite the article title at the end of your answer like this:."""
 
     try:
         response = await gemini_client.aio.models.generate_content(
@@ -118,17 +137,14 @@ Instructions:
         if db:
             doc_ref = db.collection("tickets").document(ticket_id).collection("suggestions").document()
             doc_ref.set({
-                "title": "🧠 AI Answer",
+                "title": "✨ AI Answer",
                 "text": ai_text,
-                "source": "Agent Query",
+                "source": "BookStack KB",
                 "timestamp": firestore.SERVER_TIMESTAMP
             })
-            print(f"Successfully pushed custom Q&A to Firebase for ticket {ticket_id}")
-        else:
-            print("Firebase DB not initialized.")
-            
+            print(f"Pushed answer to ticket {ticket_id}")
     except Exception as e:
-        print(f"Error generating or pushing answer: {e}")
+        print(f"Error generating or saving answer: {e}")
 
 async def generate_and_push_suggestion(transcript: str, ticket_id: str):
     """The Live Audio RAG Engine: Runs Gemini on live caller transcripts."""
