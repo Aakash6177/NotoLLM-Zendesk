@@ -12,11 +12,17 @@ from google.genai.errors import APIError
 import firebase_admin
 from firebase_admin import credentials, firestore
 from pydantic import BaseModel
+from typing import Optional, Union
 
 class AgentQuery(BaseModel):
     query: str
     ticket_id: str
     requester_id: str
+
+class AgentQuery(BaseModel):
+    query: str
+    ticket_id: Union[str, int]
+    requester_id: Optional[Union[str, int]] = None
 
 # 1. Initialize Firebase Admin securely for both Local & Render
 firebase_key_path = "/etc/secrets/firebase-adminsdk.json" 
