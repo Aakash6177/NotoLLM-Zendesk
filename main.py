@@ -225,6 +225,17 @@ async def search_zendesk(query: str, start: int = 1) -> tuple[str, list[dict]]:
             print(f"Error fetching from Zendesk: {e}")
             return "", []
 
+async def search_kb(query: str) -> tuple[str, list[dict]]:
+    mode = os.getenv("KB_SOURCE", "bookstack").lower()   # bookstack | zendesk | both
+
+    if mode == "zendesk":
+        return await search_zendesk(query)
+    if mode == "both":
+        bs_ctx, bs_src = await search_bookstack(query)
+        zd_ctx, zd_src = await search_zendesk(query, start=len(bs_src) + 1)
+        return "\n\n".join(c for c in (bs_ctx, zd_ctx) if c), bs_src + zd_src
+    return await search_bookstack(query)
+
 async def generate_and_push_suggestion(transcript: str, ticket_id: str):
     """The Live Audio RAG Engine: Runs Gemini on live caller transcripts."""
     if not db:
