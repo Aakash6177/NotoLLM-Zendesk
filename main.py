@@ -119,8 +119,8 @@ async def search_bookstack(query: str) -> tuple[str, list[dict]]:
                 if p.status_code != 200:
                     continue
                 d = p.json()
-                body = d.get("markdown") or html_to_text(d.get("html", ""))
-                parts.append(f"Source: {h['name']}\nContent: {body[:3000]}")
+                n = len(parts) + 1
+                parts.append(f"[{n}] {h['name']}\n{body[:3000]}")
                 sources.append({"title": h["name"], "url": f"{base}/link/{h['id']}"})
 
             print(f"BookStack returned {len(parts)} pages")
@@ -153,10 +153,10 @@ Knowledge Base pages:
 {context}
 
 Instructions:
-1. Answer clearly and concisely.
+1. Answer clearly and concisely, using a numbered list for steps (one per line).
 2. Use ONLY the Knowledge Base pages above.
 3. If the answer is not there, say "I cannot find this information in the Knowledge Base."
-4. Cite pages inline as [Source: Page Title]."""
+4. Cite using the page number in brackets right after the claim, like [1] or [2]. Do not write page titles or a sources list."""
 
     text = "The AI service is busy. Please try again in a moment."
     for attempt in range(4):
