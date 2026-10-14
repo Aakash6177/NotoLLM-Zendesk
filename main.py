@@ -26,6 +26,9 @@ class AgentQuery(BaseModel):
     ticket_id: Union[str, int]
     requester_id: Optional[Union[str, int]] = None
 
+STOP = {"what","is","the","a","an","for","to","how","do","i","we","of","and","in","on","are",
+        "about","should","can","my","our","does","this","that","matter","if","when","who"}
+
 # 1. Initialize Firebase Admin securely for both Local & Render
 firebase_key_path = "/etc/secrets/firebase-adminsdk.json" 
 
