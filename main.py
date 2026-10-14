@@ -119,6 +119,7 @@ async def search_bookstack(query: str) -> tuple[str, list[dict]]:
                 if p.status_code != 200:
                     continue
                 d = p.json()
+                body = d.get("markdown") or html_to_text(d.get("html", ""))
                 n = len(parts) + 1
                 parts.append(f"[{n}] {h['name']}\n{body[:3000]}")
                 sources.append({"title": h["name"], "url": f"{base}/link/{h['id']}"})
@@ -137,7 +138,7 @@ async def handle_custom_agent_query(query: str, ticket_id):
         return
 
     ref = db.collection("tickets").document(ticket_id).collection("suggestions").document()
-    context, sources = await search_bookstack(query)
+    context, sources = await search_kb(query)
 
     if not context:
         ref.set({"title": "AI Answer",
