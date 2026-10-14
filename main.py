@@ -13,6 +13,8 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from pydantic import BaseModel
 from typing import Optional, Union
+import re
+from bs4 import BeautifulSoup
 
 class AgentQuery(BaseModel):
     query: str
@@ -65,92 +67,113 @@ async def authenticate_connection(api_key: str = Query(None)):
         return False
     return True
 
-async def search_bookstack(query: str) -> str:
-    """Searches BookStack KB on localhost / remote and returns markdown context."""
-    domain = os.getenv("BOOKSTACK_DOMAIN", "localhost:8080")
+def bookstack_base() -> str:
+    raw = (os.getenv("BOOKSTACK_URL") or os.getenv("BOOKSTACK_DOMAIN") or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    if raw.startswith(("http://", "https://")):
+        return raw
+    local = any(h in raw for h in ("localhost", "127.0.0.1", "host.docker.internal"))
+    return f"{'http' if local else 'https'}://{raw}"
+
+def html_to_text(html: str) -> str:
+    return BeautifulSoup(html or "", "html.parser").get_text(" ", strip=True)
+
+async def search_bookstack(query: str) -> tuple[str, list[dict]]:
+    """Returns (context_text, sources) where sources = [{'title','url'}]."""
+    base = bookstack_base()
     token_id = os.getenv("BOOKSTACK_TOKEN_ID")
     token_secret = os.getenv("BOOKSTACK_TOKEN_SECRET")
-    
-    if not all([domain, token_id, token_secret]):
-        print("BookStack credentials or domain missing.")
-        return ""
-        
-    encoded_query = urllib.parse.quote(query)
-    
-    # 1. Determine HTTP vs HTTPS
-    protocol = "http" if any(h in domain for h in ["localhost", "127.0.0.1", "host.docker.internal"]) else "https"
-    
-    search_url = f"{protocol}://{domain}/api/search?query={encoded_query}"
-    headers = {
-        "Authorization": f"Token {token_id}:{token_secret}"
-    }
-    
-    async with httpx.AsyncClient() as client:
+
+    missing = [n for n, v in [("BOOKSTACK_URL", base),
+                              ("BOOKSTACK_TOKEN_ID", token_id),
+                              ("BOOKSTACK_TOKEN_SECRET", token_secret)] if not v]
+    if missing:
+        print(f"BookStack missing env vars: {missing}")
+        return "", []
+
+    headers = {"Authorization": f"Token {token_id}:{token_secret}"}
+    keywords = " ".join(w for w in re.findall(r"[a-z0-9]+", query.lower())
+                        if w not in STOP and len(w) > 2)
+
+    async with httpx.AsyncClient(timeout=20) as client:
         try:
-            # 2. Search for matching pages
-            response = await client.get(search_url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            
-            results = [item for item in data.get("data", []) if item.get("type") == "page"]
-            if not results:
-                return ""
-                
-            # 3. Pull top 2 articles and their markdown body
-            context_parts = []
-            for article in results[:2]:
-                title = article.get("name", "")
-                page_id = article.get("id")
-                
-                page_url = f"{protocol}://{domain}/api/pages/{page_id}"
-                page_resp = await client.get(page_url, headers=headers)
-                
-                if page_resp.status_code == 200:
-                    page_data = page_resp.json()
-                    body = page_data.get("markdown", "") or page_data.get("preview_html", "")
-                    context_parts.append(f"Source: {title}\nContent: {body[:2000]}")
-                
-            return "\n\n".join(context_parts)
-            
+            hits = []
+            for q in dict.fromkeys([query, keywords]):      # full question, then keywords
+                if not q:
+                    continue
+                r = await client.get(f"{base}/api/search",
+                                     params={"query": q, "count": 10}, headers=headers)
+                print(f"BookStack search '{q}' -> {r.status_code}")
+                r.raise_for_status()
+                hits = [i for i in r.json().get("data", []) if i.get("type") == "page"]
+                if hits:
+                    break
+
+            parts, sources = [], []
+            for h in hits[:3]:
+                p = await client.get(f"{base}/api/pages/{h['id']}", headers=headers)
+                if p.status_code != 200:
+                    continue
+                d = p.json()
+                body = d.get("markdown") or html_to_text(d.get("html", ""))
+                parts.append(f"Source: {h['name']}\nContent: {body[:3000]}")
+                sources.append({"title": h["name"], "url": f"{base}/link/{h['id']}"})
+
+            print(f"BookStack returned {len(parts)} pages")
+            return "\n\n".join(parts), sources
         except Exception as e:
             print(f"Error fetching from BookStack: {e}")
-            return ""
+            return "", []
 
-async def handle_custom_agent_query(query: str, ticket_id: str):
+async def handle_custom_agent_query(query: str, ticket_id):
+    ticket_id = str(ticket_id)
     print(f"Processing query for ticket {ticket_id}: {query}")
-    
-    # Swap out search_help_center with search_bookstack
-    kb_context = await search_bookstack(query)
-    
-    prompt = f"""You are an internal AI assistant for a customer support agent. The agent asked: "{query}"
+    if not db:
+        print("Skipping Firebase push: Firebase is not initialized.")
+        return
 
-Company Knowledge Base (BookStack):
-{kb_context if kb_context else "No relevant articles found."}
+    ref = db.collection("tickets").document(ticket_id).collection("suggestions").document()
+    context, sources = await search_bookstack(query)
+
+    if not context:
+        ref.set({"title": "AI Answer",
+                 "text": "No matching pages were found in the Knowledge Base.",
+                 "source": "BookStack KB", "sources": [],
+                 "timestamp": firestore.SERVER_TIMESTAMP})
+        return
+
+    prompt = f"""You are an internal AI assistant for a customer support agent.
+The agent asked: "{query}"
+
+Knowledge Base pages:
+{context}
 
 Instructions:
-1. Answer the agent's question clearly and concisely.
-2. Ground your answer STRICTLY in the Company Knowledge Base text provided above.
-3. If the answer is not in the knowledge base, say "I cannot find this information in the Knowledge Base."
-4. Always cite the article title at the end of your answer like this:."""
+1. Answer clearly and concisely.
+2. Use ONLY the Knowledge Base pages above.
+3. If the answer is not there, say "I cannot find this information in the Knowledge Base."
+4. Cite pages inline as [Source: Page Title]."""
 
-    try:
-        response = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
-        )
-        ai_text = response.text.strip()
-        
-        if db:
-            doc_ref = db.collection("tickets").document(ticket_id).collection("suggestions").document()
-            doc_ref.set({
-                "title": "✨ AI Answer",
-                "text": ai_text,
-                "source": "BookStack KB",
-                "timestamp": firestore.SERVER_TIMESTAMP
-            })
-            print(f"Pushed answer to ticket {ticket_id}")
-    except Exception as e:
-        print(f"Error generating or saving answer: {e}")
+    text = "The AI service is busy. Please try again in a moment."
+    for attempt in range(4):
+        try:
+            resp = await gemini_client.aio.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            text = (resp.text or "I cannot find this information in the Knowledge Base.").strip()
+            break
+        except APIError as e:
+            if e.code in (429, 503) and attempt < 3:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            print(f"Gemini error: {e}")
+            break
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            break
+
+    ref.set({"title": "AI Answer", "text": text, "source": "BookStack KB",
+             "sources": sources, "timestamp": firestore.SERVER_TIMESTAMP})
+    print(f"Pushed answer to ticket {ticket_id}")
 
 async def generate_and_push_suggestion(transcript: str, ticket_id: str):
     """The Live Audio RAG Engine: Runs Gemini on live caller transcripts."""
