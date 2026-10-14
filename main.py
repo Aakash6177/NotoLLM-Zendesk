@@ -178,6 +178,53 @@ Instructions:
              "sources": sources, "timestamp": firestore.SERVER_TIMESTAMP})
     print(f"Pushed answer to ticket {ticket_id}")
 
+async def search_zendesk(query: str, start: int = 1) -> tuple[str, list[dict]]:
+    sub = (os.getenv("ZENDESK_SUBDOMAIN") or "").strip()
+    if not sub:
+        print("Zendesk missing env var: ZENDESK_SUBDOMAIN")
+        return "", []
+
+    base = f"https://{sub}.zendesk.com/api/v2/help_center"
+    email, token = os.getenv("ZENDESK_EMAIL"), os.getenv("ZENDESK_API_TOKEN")
+    auth = (f"{email}/token", token) if email and token else None   # optional; public articles need none
+
+    kws = [w for w in re.findall(r"[a-z0-9]+", query.lower()) if w not in STOP and len(w) > 2]
+
+    async with httpx.AsyncClient(timeout=20, auth=auth) as client:
+        try:
+            arts = []
+            for q in dict.fromkeys([query, " ".join(kws)]):
+                if not q:
+                    continue
+                r = await client.get(f"{base}/articles/search.json", params={"query": q, "per_page": 5})
+                print(f"Zendesk search '{q}' -> {r.status_code}")
+                if r.status_code == 200:
+                    arts = r.json().get("results", [])
+                if arts:
+                    break
+
+            if not arts and kws:   # fallback: rank all articles by keyword overlap
+                r = await client.get(f"{base}/en-us/articles.json", params={"per_page": 100})
+                print(f"Zendesk list fallback -> {r.status_code}")
+                if r.status_code == 200:
+                    def score(a):
+                        text = (a["title"] + " " + html_to_text(a.get("body", ""))).lower()
+                        return sum(text.count(k) for k in kws)
+                    ranked = sorted(r.json().get("articles", []), key=score, reverse=True)
+                    arts = [a for a in ranked if score(a) > 0]
+
+            parts, sources = [], []
+            for a in arts[:3]:
+                n = start + len(parts)
+                parts.append(f"[{n}] {a['title']}\n{html_to_text(a.get('body', ''))[:3000]}")
+                sources.append({"title": a["title"], "url": a["html_url"]})
+
+            print(f"Zendesk returned {len(parts)} articles")
+            return "\n\n".join(parts), sources
+        except Exception as e:
+            print(f"Error fetching from Zendesk: {e}")
+            return "", []
+
 async def generate_and_push_suggestion(transcript: str, ticket_id: str):
     """The Live Audio RAG Engine: Runs Gemini on live caller transcripts."""
     if not db:
